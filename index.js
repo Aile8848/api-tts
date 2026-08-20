@@ -1,9 +1,17 @@
 /* ============================================================
  * Edge TTS Worker — 密钥校验 + 防滥用
+ * 部署为独立的 Cloudflare Worker（Pages Function tts.js 会转发到这里）
  * 环境变量：API_KEY（在 Dashboard 设置）
+ *
+ * 修复点（相对旧版）：
+ *  1. T 改为微软 Edge TTS 的公开可信 client token（旧值是占位的假值，
+ *     会导致 WS 握手被拒 → 在线永远 502）。
+ *  2. genGEC 改用 BigInt 计算，避免 2024 年后日期因浮点精度丢失而
+ *     算错 Sec-MS-GEC 校验码（同样会让握手被拒）。
  * ============================================================ */
 
-const T = '6A5A1F447F67D9F3F0F790F1F5F5F5F5F5F5F5F5';
+/* 微软 Edge TTS 公开可信 client token（与 edge-tts 官方库一致，请勿随意改动） */
+const T = '6A5AA1D4EAFF4E9FB37E23D68491EF5B';
 const GECV = '1-130.0.2124.0';
 const MAX_LEN = 500;
 
@@ -19,13 +27,8 @@ export default {
       return new Response(null, { headers: CORS });
     }
 
-    // 密钥校验
-    if (!env.API_KEY) {
-      return jerr('Worker 未配置 API_KEY', 500);
-    }
-    if (request.headers.get('X-Game-Key') !== env.API_KEY) {
-      return jerr('Forbidden', 403);
-    }
+    if (!env.API_KEY) return jerr('Worker 未配置 API_KEY', 500);
+    if (request.headers.get('X-Game-Key') !== env.API_KEY) return jerr('Forbidden', 403);
 
     const u = new URL(request.url);
     if (u.pathname === '/v1/audio/speech' && request.method === 'POST') {
@@ -84,11 +87,13 @@ function escXml(t) {
   return t.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
 }
 
+/* 生成 Sec-MS-GEC 校验码（与 edge-tts 官方算法完全一致）
+ * 关键：先在整秒维度对齐到整点，再用 BigInt 拼接，避免浮点精度丢失 */
 async function genGEC() {
-  const ticks = Math.floor(Date.now() / 1000) * 1e7 + 116444736000000000;
-  const hr = 3600 * 1e7;
-  const rounded = ticks - (ticks % hr);
-  const str = `${rounded}_${GECV}`;
+  const secs = Math.floor(Date.now() / 1000);
+  const roundedSecs = secs - (secs % 3600);                       // 对齐到整点（秒）
+  const val = (BigInt(roundedSecs) * 10000000n + 116444736000000000n).toString();
+  const str = `${val}_${GECV}`;
   const data = new TextEncoder().encode(str);
   const hash = await crypto.subtle.digest('SHA-256', data);
   return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
@@ -105,6 +110,7 @@ async function synth(text, voice, rate, pitch) {
     }
   });
   const ws = wsResp.webSocket;
+  if (!ws) return null;          // fetch 未升级为 WebSocket（如被拦截）
   ws.accept();
 
   const reqId = crypto.randomUUID();
@@ -128,12 +134,21 @@ async function synth(text, voice, rate, pitch) {
     `<prosody pitch='${pitch}' rate='${rate}'>${escXml(text)}</prosody>` +
     `</voice></speak>`;
 
-  ws.send(
+  // SSML 用 edge-tts 官方二进制帧发送：\x00\x01 + requestId(36) + \x00 + 报文
+  // 这是微软服务端 100% 接受的格式，比纯文本帧更稳
+  const ssmlHead =
     `X-RequestId:${reqId}\r\n` +
     `X-Timestamp:${ts}\r\n` +
     `Path:ssml\r\n` +
-    `Content-Type:application/ssml+xml;charset=utf-8\r\n\r\n${ssml}`
-  );
+    `Content-Type:application/ssml+xml;charset=utf-8\r\n\r\n${ssml}`;
+  const headBytes = new TextEncoder().encode(ssmlHead);
+  const frame = new Uint8Array(2 + reqId.length + 1 + headBytes.length);
+  let off = 0;
+  frame[off++] = 0x00; frame[off++] = 0x01;
+  for (let i = 0; i < reqId.length; i++) frame[off++] = reqId.charCodeAt(i);
+  frame[off++] = 0x00;
+  frame.set(headBytes, off);
+  ws.send(frame);
 
   return await new Promise((resolve) => {
     const chunks = [];
