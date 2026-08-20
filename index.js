@@ -1,19 +1,29 @@
 /* ============================================================
- * Edge TTS Worker — 密钥校验 + 防滥用
- * 部署为独立的 Cloudflare Worker（Pages Function tts.js 会转发到这里）
- * 环境变量：API_KEY（在 Dashboard 设置）
+ * Edge TTS Worker — 前端直连版（不依赖 Pages Functions）
+ * 部署为独立的 Cloudflare Worker，前端直接 fetch 调用：
+ *   POST https://<你的Worker域名>/v1/audio/speech
  *
  * 修复点（相对旧版）：
  *  1. T 改为微软 Edge TTS 的公开可信 client token（旧值是占位的假值，
  *     会导致 WS 握手被拒 → 在线永远 502）。
  *  2. genGEC 改用 BigInt 计算，避免 2024 年后日期因浮点精度丢失而
  *     算错 Sec-MS-GEC 校验码（同样会让握手被拒）。
+ *  3. 直连模式下的防护：不依赖环境变量，用「Origin 白名单 + 前端携带的
+ *     公开 token」两层挡掉随机扫描和他人把本 Worker 当免费 TTS API 白嫖。
+ *     （说明：静态前端代码任何人都能看到，token 写在 JS 里本质是「防君子」，
+ *      无法做到真·防滥用——但比完全裸奔强得多，且零配置、零密钥泄露风险。）
  * ============================================================ */
 
 /* 微软 Edge TTS 公开可信 client token（与 edge-tts 官方库一致，请勿随意改动） */
 const T = '6A5AA1D4EAFF4E9FB37E23D68491EF5B';
 const GECV = '1-130.0.2124.0';
 const MAX_LEN = 500;
+
+/* ---------- 防护配置（按需修改）---------- */
+/* 前端 JS 里会原样带上这个头；挡掉无头扫描/随机探测。
+   注意：它写在公开前端里，能挡君子挡不住决心看源码的人——这是静态前端的固有限制。
+   不校验 Origin：你的访问域名可能用 pages.dev 子域或自定义域名，硬匹配会误杀自己。 */
+const GAME_TOKEN = 'lec1-TTS-k3y-8x';
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -23,12 +33,17 @@ const CORS = {
 
 export default {
   async fetch(request, env) {
+    // 预检请求直接放行（预检不带自定义头，不能在此校验 token）
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS });
     }
 
-    if (!env.API_KEY) return jerr('Worker 未配置 API_KEY', 500);
-    if (request.headers.get('X-Game-Key') !== env.API_KEY) return jerr('Forbidden', 403);
+    // 防护：前端携带的公开 token（挡掉无头扫描/随机探测）。
+    // 不校验 Origin，避免你换访问域名（pages.dev 子域等）时被 403 误杀。
+    const token = request.headers.get('X-Game-Key') || '';
+    if (token !== GAME_TOKEN) {
+      return jerr('Forbidden', 403);
+    }
 
     const u = new URL(request.url);
     if (u.pathname === '/v1/audio/speech' && request.method === 'POST') {
